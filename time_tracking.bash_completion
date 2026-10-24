@@ -1,0 +1,18 @@
+# Bash completion for time_tracking
+# Installed to /etc/bash_completion.d/time_tracking.bash_completion
+
+function _time_tracking()
+{
+  latest="${COMP_WORDS[$COMP_CWORD]}"
+  words=$(time_tracking completions "${COMP_WORDS[*]}" 2> /dev/null)
+
+  mapfile -t COMPREPLY < <( compgen -W "$words" -- "$latest" | quoteIfNeeded )
+  return 0
+}
+
+quoteIfNeeded() {
+  # Add double-quotes to a string with spaces. Strings without spaces remain unchanged.
+  awk '/ / { print "\""$0"\"" } /^[^ ]+$/ { print $0 }'
+}
+
+complete -F _time_tracking time_tracking

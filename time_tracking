@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+import sys
+import time
+import datetime
+
+from pathlib import Path
+
+import duckdb
+import argparse
+
+
+def _load_tracking_data() -> duckdb.DuckDBPyConnection:
+    tracking_path = Path().cwd() / "time_tracking.csv"
+
+    if not tracking_path.exists():
+        print("TODO: tracking path does not exist", file=sys.stderr)
+        raise FileNotFoundError
+
+    con = duckdb.connect()
+    con.read_csv(tracking_path).to_table("tracking")
+
+    return con
+
+
+def _write_tracking_data(con: duckdb.DuckDBPyConnection) -> None:
+    tracking_path = Path().cwd() / "time_tracking.csv"
+
+    result = con.sql('SELECT DISTINCT * FROM tracking ORDER BY "start"')
+    result.to_csv(str(tracking_path))
+
+
+def start_task():
+    tracking_path = Path().cwd() / "time_tracking.csv"
+
+    task = "Default"
+
+    if len(sys.argv) > 2:
+        task = sys.argv[2]
+
+    if not tracking_path.exists():
+        with tracking_path.open("w+") as f:
+            f.write(
+                f"start;end;task;comment\n{time.strftime('%Y-%m-%d %H:%M:%S')};;{task};")
+        return
+
+    con = _load_tracking_data()
+
+    running_trackers = con.sql(
+        "SELECT task FROM tracking WHERE \"end\" IS NOT DISTINCT FROM null;")
+
+    is_running = len(running_trackers.fetchall()) > 0
+
+    if is_running:
+        print("Other trackers are currently running, couldn't start a new timer!")
+        return
+
+    con.execute(
+        "INSERT INTO tracking(start,\"end\",task) values (strftime(now(), '%Y-%m-%d %H:%M:%S'), null, ?)", [task])
+
+    _write_tracking_data(con)
+
+    print(f"Started tracking time for task {task!r}")
+
+
+def stop_task():
+    print("Stopping previous timer")
+
+    con = _load_tracking_data()
+
+    running_timer = con.sql(
+        "SELECT task FROM tracking WHERE \"end\" IS NOT DISTINCT FROM null;").fetchall()
+
+    if len(running_timer) <= 0:
+        print("No timers to stop")
+        return
+
+    if len(running_timer) >= 2:
+        print("Error: More than one timer is currently running, this may lead to inconsistencies!")
+        return
+
+    con.execute(
+        "UPDATE tracking SET \"end\" = strftime(now(), '%Y-%m-%d %H:%M:%S') WHERE \"end\" is not distinct from null;")
+
+    _write_tracking_data(con)
+
+    print(
+        f"Stopped timer for task {running_timer[0][0]!r} successfully!")
+
+
+def rename_tasks():
+    if len(sys.argv) < 4:
+        print("Usage: time_tracking rename <src> <dest>")
+        return
+
+    con = _load_tracking_data()
+
+    affected_rows = con.execute("""
+UPDATE tracking
+SET task = ?
+WHERE task = ?
+""", [sys.argv[3], sys.argv[2]]).fetchall()[0][0]
+
+    _write_tracking_data(con)
+
+    print(
+        f"Renamed {affected_rows} instances of task {sys.argv[2]!r} to {sys.argv[3]!r}")
+
+
+def _fill_zeros(con: duckdb.DuckDBPyConnection) -> None:
+    """Fill the tracking relation with intervals of length zero.
+    This ensures that over the entire time tracking range, each day has at least one entry.
+    For certain analysis operations, such as calculating averages over the entire timespan, this is required for correctness."""
+    con.sql("""WITH
+    date_adders (i) AS (
+        SELECT
+            *
+        FROM
+            RANGE (
+                DATE (
+                    (
+                        SELECT
+                            max("end")
+                        FROM
+                            tracking
+                    )
+                ) - DATE (
+                    (
+                        SELECT
+                            min("start")
+                        FROM
+                            tracking
+                    )
+                ) + 1
+            )
+    ),
+    dates (d) AS (
+        SELECT
+            DATE (min("start")) + INTERVAL (i) DAY
+        FROM
+            tracking,
+            date_adders
+        GROUP BY
+            i
+    )
+INSERT INTO tracking ("start", "end")
+SELECT
+    d,
+    d
+FROM
+    dates
+WHERE
+    NOT EXISTS (
+        SELECT
+            "start"
+        FROM
+            tracking
+        WHERE
+            d BETWEEN "start" AND "end"
+    )
+ORDER BY
+    d;""")
+
+
+def _parse_special_dates(date: str) -> str:
+    TIME_FORMAT = "%Y-%m-%d"
+    today = datetime.date.today()
+
+    if date.lower() == "today":
+        return today.strftime(TIME_FORMAT)
+
+    if date.lower() == "yesterday":
+        yesterday = today - datetime.timedelta(1)
+        return yesterday.strftime(TIME_FORMAT)
+
+    if date.lower() == "this-week":
+        first_of_week = today - datetime.timedelta(today.isoweekday() - 1)
+        return first_of_week.strftime(TIME_FORMAT)
+
+    return date
+
+
+def analyze_tasks():
+    USAGE_MESSAGE = """Usage time_tracking analyze COMMAND
+
+Commands:
+  average        See the weekly, monthly and yearly average of time spent
+  per_day        See the total time spent per day
+  per_month      See the total time spent per month
+  per_task       See the total time spent on each task
+  per_week       See the total time spent per week
+  total          See the total time spent on all tasks combined
+
+Options:
+  --after        Filter out entries that are before DATE;
+                 DATE is either "today", "yesterday", "this-week" (First day of the current week)
+                 or a date in the format YYYY-MM-DD
+  --before       Filter out entries that are on or after DATE
+  --on           Filter all entries where the start date is not equal to DATE
+  --week-of      Filter out entries where the start date is not in the week of DATE
+  --export       Export the result as CSV; Specifies the export path
+
+
+"""
+
+    if len(sys.argv) < 3:
+        print(USAGE_MESSAGE)
+        return
+
+    con = _load_tracking_data()
+
+    # Simulate, that all tasks have been finished to allow analyzing while tasks are running
+    # This can be safely done, because analysis functions do not write to `time_tracking.csv`
+    con.execute(
+        "UPDATE tracking SET \"end\" = strftime(now(), '%Y-%m-%d %H:%M:%S') WHERE \"end\" is not distinct from null;")
+
+    option_parser = argparse.ArgumentParser(
+        add_help=False,
+        suggest_on_error=False,
+        exit_on_error=False
+    )
+
+    option_parser.add_argument(
+        "--after", required=False)
+    option_parser.add_argument(
+        "--before", required=False)
+    option_parser.add_argument(
+        "--on", required=False)
+    option_parser.add_argument(
+        "--week-of", required=False)
+    option_parser.add_argument(
+        "--export", required=False)
+
+    try:
+        options = option_parser.parse_args(sys.argv[3:])
+    except argparse.ArgumentError:
+        options = None
+
+    if options:
+        if options.after:
+            options_after = _parse_special_dates(options.after)
+            con.execute('DELETE FROM tracking WHERE "start" < ?',
+                        parameters=[options_after])
+        if options.before:
+            options_before = _parse_special_dates(options.before)
+            con.execute('DELETE FROM tracking WHERE "start" > ?',
+                        parameters=[options_before])
+        if options.on:
+            options_on = _parse_special_dates(options.on)
+            con.execute("""DELETE FROM tracking WHERE ("start" > (?::datetime + '1day'::interval)) OR "start" < ?""",
+                        parameters=[options_on, options_on])
+        if options.week_of:
+            options_week_of = _parse_special_dates(options.week_of)
+            con.execute('DELETE FROM tracking WHERE week("start") != week(?::datetime)',
+                        parameters=[options_week_of])
+
+    if sys.argv[2] in ["average"]:
+        result = analyze_average(con)
+    elif sys.argv[2] in ["per_task"]:
+        result = analyze_per_task(con)
+    elif sys.argv[2] in ["per_week"]:
+        result = analyze_per_week(con)
+    elif sys.argv[2] in ["per_day"]:
+        result = analyze_per_day(con)
+    elif sys.argv[2] in ["per_month"]:
+        result = analyze_per_month(con)
+    elif sys.argv[2] in ["total"]:
+        result = analyze_total(con)
+    else:
+        print(USAGE_MESSAGE)
+        return
+
+    print(result)
+    if options and options.export:
+        export_path = Path(options.export).expanduser().resolve()
+
+        # TODO: Refactor
+        if export_path.parent.is_dir() and not export_path.exists():
+            result.to_csv(str(export_path))
+        else:
+            print("Export failed: Path doesn't exist")
+
+
+def analyze_total(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    return con.sql("""
+WITH
+    durations (duration) AS (
+        SELECT
+            array_agg ("end" - "start"),
+        FROM
+            tracking
+    )
+SELECT
+    list_reduce (duration, lambda acc, x: acc + x) as total_time,
+    round(datepart('epoch', list_reduce (duration, lambda acc, x: acc + x)) / (30 * 60 * 60), 2) as ects,
+FROM
+    durations;
+""")
+
+
+def analyze_per_task(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    return con.sql("""
+WITH
+    task_durations (durations, task) AS (
+        SELECT
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x),
+            task
+        FROM
+            tracking
+        GROUP BY
+            task
+    )
+SELECT
+    durations as task_duration,
+    task
+FROM
+    task_durations
+ORDER BY task_duration, task;
+""")
+
+
+def analyze_per_week(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    _fill_zeros(con)
+    return con.sql("""
+WITH
+    weekly_task_durations (week, w_durations) AS (
+        SELECT
+            date_trunc ('week', "start") AS week,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            week
+    )
+SELECT
+    date_part('year', week) AS year,
+    date_part('week', week) AS week,
+    w_durations AS duration
+FROM
+    weekly_task_durations
+ORDER BY
+    week;
+""")
+
+
+def analyze_per_day(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    return con.sql("""
+WITH
+    daily_task_durations (day, d_durations) AS (
+        SELECT
+            date_trunc ('day', "start") AS day,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            day
+    )
+SELECT
+    strftime("day", '%Y-%m-%d') AS day,
+    d_durations AS duration
+FROM
+    daily_task_durations
+ORDER BY
+    day;
+""")
+
+
+def analyze_per_month(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    _fill_zeros(con)
+    return con.sql("""
+WITH
+    monthly_task_durations (month, m_durations) AS (
+        SELECT
+            date_trunc ('month', "start") AS month,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            month
+    )
+SELECT
+    date_part('year', month) AS year,
+    date_part('month', month) AS month,
+    m_durations AS duration
+FROM
+    monthly_task_durations
+ORDER BY
+    month;
+""")
+
+
+def analyze_average(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
+    _fill_zeros(con)
+    return con.sql("""
+WITH
+    weekly_task_durations (week, w_durations) AS (
+        SELECT
+            date_trunc ('week', "start") AS week,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            week
+    ),
+    monthly_task_durations (month, m_durations) AS (
+        SELECT
+            date_trunc ('month', "start") AS month,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            month
+    ),
+    yearly_task_durations (year, y_durations) AS (
+        SELECT
+            date_trunc ('year', "start") AS year,
+            list_reduce (array_agg ("end" - "start"), lambda acc, x: acc + x) ,
+        FROM
+            tracking
+        GROUP BY
+            year
+    )
+SELECT
+    date_trunc('second', avg(y_durations)) as yearly_average,
+    date_trunc('second', avg(m_durations)) as monthly_average,
+    date_trunc('second', avg(w_durations)) as weekly_average
+FROM
+    yearly_task_durations,
+    monthly_task_durations,
+    weekly_task_durations;
+""")
+
+
+def print_completions():
+    if len(sys.argv) < 3:
+        return
+    COMP_WORDS = sys.argv[2].split(" ")
+
+    other = COMP_WORDS[:-1]
+
+    if len(other) == 0:
+        return
+
+    if len(other) == 1:
+        print("analyze end rename start")
+        return
+
+    has_full_task_completion = sys.argv[2].count("\"") >= 2 or (
+        sys.argv[2].count("\"") == 0 and len(other) >= 3)
+    if other[1] in ["start", "rename"] and not has_full_task_completion:
+        print_task_suggestions()
+        return
+
+    if other[1] in ["a", "analyze"]:
+        print_analysis_suggestions(other)
+        return
+
+
+def print_analysis_suggestions(other: list[str]):
+    if len(other) == 2:
+        print("average per_task per_week per_day per_month total")
+        return
+
+    if not other[2] in ["average", "total", "per_task", "per_week", "per_day", "per_month"]:
+        return
+
+    if other[-1] in ["--after",
+                     "--before",
+                     "--on",
+                     "--week-of"]:
+        print("today yesterday this-week")
+        return
+
+    suggestions = ""
+
+    options: list[str] = ["--after",
+                          "--before",
+                          "--on",
+                          "--week-of",
+                          "--export"]
+
+    # An option suggestion is excluded, if any option mentioned in the array is already present
+    excluded_option_suggestions: dict[str, list[str]] = {
+        "--after": ["--on", "--week-of"],
+        "--before": ["--on", "--week-of"],
+        "--on": ["--after", "--before", "--week-of"],
+        "--week-of": ["--after", "--before", "--on"],
+    }
+
+    for option in options:
+        if option in other:
+            continue
+
+        if any(s in other for s in excluded_option_suggestions.get(option, [])):
+            continue
+
+        suggestions += option + " "
+
+    print(suggestions.strip())
+
+
+def print_task_suggestions():
+    task_suggestions = "Default "
+
+    try:
+        con = _load_tracking_data()
+    except:
+        print(task_suggestions.strip())
+        return
+
+    t = con.sql("SELECT DISTINCT task FROM tracking ORDER BY task")
+
+    for res in t.fetchall():
+        task_suggestions += f"'{res[0]}' "
+
+    print(task_suggestions.strip())
+
+
+def main():
+    USAGE_MESSAGE = """Usage: time_tracking COMMAND
+
+Commands:
+  analyze                     Analyze statistics on previous work
+  rename <src> <dest>         Rename all occurences of <src> to <dest>
+  start                       Start tracking time for a task
+  stop                        Stop tracking time for a task
+  """
+
+    if (len(sys.argv) < 2):
+        print(USAGE_MESSAGE)
+        return
+
+    if sys.argv[1] in ["start"]:
+        start_task()
+    elif sys.argv[1] in ["stop", "end", "e"]:
+        stop_task()
+    elif sys.argv[1] in ["rename", "r"]:
+        rename_tasks()
+    elif sys.argv[1] in ["analyze", "a"]:
+        analyze_tasks()
+    elif sys.argv[1] in ["completions"]:
+        print_completions()
+    else:
+        print(USAGE_MESSAGE)
+
+
+if __name__ == "__main__":
+    main()
