@@ -41,6 +41,17 @@ def _write_tracking_data(con: duckdb.DuckDBPyConnection) -> None:
     result.to_csv(str(tracking_path))
 
 
+def which_file():
+    tracking_path = _find_tracking_path()
+
+    if not tracking_path.exists():
+        tracking_path = Path().cwd() / "time_tracking.csv"
+        print(f"{tracking_path} (Will be created)")
+        return
+
+    print(tracking_path)
+
+
 def start_task():
     tracking_path = _find_tracking_path()
 
@@ -455,7 +466,7 @@ def print_completions():
         return
 
     if len(other) == 1:
-        print("analyze end rename start")
+        print("analyze end rename start which")
         return
 
     has_full_task_completion = sys.argv[2].count("\"") >= 2 or (
@@ -537,13 +548,16 @@ Commands:
   rename <src> <dest>         Rename all occurences of <src> to <dest>
   start                       Start tracking time for a task
   stop                        Stop tracking time for a task
+  which                       Print the path to the "time_tracking.csv" file that will be used
   """
 
     if (len(sys.argv) < 2):
         print(USAGE_MESSAGE)
         return
 
-    if sys.argv[1] in ["start"]:
+    if sys.argv[1] in ["which"]:
+        which_file()
+    elif sys.argv[1] in ["start"]:
         start_task()
     elif sys.argv[1] in ["stop", "end", "e"]:
         stop_task()
