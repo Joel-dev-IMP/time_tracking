@@ -9,8 +9,20 @@ import duckdb
 import argparse
 
 
-def _load_tracking_data() -> duckdb.DuckDBPyConnection:
+def _find_tracking_path() -> Path:
     tracking_path = Path().cwd() / "time_tracking.csv"
+
+    while not tracking_path.exists():
+        tracking_path = tracking_path.parent.parent / "time_tracking.csv"
+
+        if tracking_path.parent == tracking_path.parent.parent:
+            return tracking_path
+
+    return tracking_path
+
+
+def _load_tracking_data() -> duckdb.DuckDBPyConnection:
+    tracking_path = _find_tracking_path()
 
     if not tracking_path.exists():
         print("TODO: tracking path does not exist", file=sys.stderr)
@@ -23,14 +35,14 @@ def _load_tracking_data() -> duckdb.DuckDBPyConnection:
 
 
 def _write_tracking_data(con: duckdb.DuckDBPyConnection) -> None:
-    tracking_path = Path().cwd() / "time_tracking.csv"
+    tracking_path = _find_tracking_path()
 
     result = con.sql('SELECT DISTINCT * FROM tracking ORDER BY "start"')
     result.to_csv(str(tracking_path))
 
 
 def start_task():
-    tracking_path = Path().cwd() / "time_tracking.csv"
+    tracking_path = _find_tracking_path()
 
     task = "Default"
 
@@ -38,6 +50,8 @@ def start_task():
         task = sys.argv[2]
 
     if not tracking_path.exists():
+        tracking_path = Path().cwd() / "time_tracking.csv"
+
         with tracking_path.open("w+") as f:
             f.write(
                 f"start;end;task;comment\n{time.strftime('%Y-%m-%d %H:%M:%S')};;{task};")
